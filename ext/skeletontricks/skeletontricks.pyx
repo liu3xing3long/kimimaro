@@ -359,18 +359,39 @@ def get_mapping(
 
   remap = {}
 
+  if orig_labels.size == 0:
+    return remap
+
+  cdef uint32_t last_label = cc_labels[0,0,0]
+  remap[cc_labels[0,0,0]] = orig_labels[0,0,0]
+
   for z in range(sz):
     for y in range(sy):
       for x in range(sx):
+        if last_label == cc_labels[x,y,z]:
+          continue
         remap[cc_labels[x,y,z]] = orig_labels[x,y,z]
+        last_label = cc_labels[x,y,z]
 
   return remap
 
-def compute_centroids(cnp.ndarray[uint32_t, ndim=2] labels):
-  """Compute the centroid for every label on a 2D image at once."""
+def compute_centroids(
+    cnp.ndarray[uint32_t, ndim=2] labels,
+    float wx, float wy
+  ):
+  """
+  compute_centroids(
+    cnp.ndarray[uint32_t, ndim=2] labels,
+    float wx, float wy
+  )
 
-  cdef uint64_t[:] xsum = np.zeros( (labels.size,), dtype=np.uint64)
-  cdef uint64_t[:] ysum = np.zeros( (labels.size,), dtype=np.uint64)
+  Compute the centroid for every label on a 2D image at once.
+
+  Returns: { $segid: (x, y), ... }
+  """
+
+  cdef float[:] xsum = np.zeros( (labels.size,), dtype=np.float32)
+  cdef float[:] ysum = np.zeros( (labels.size,), dtype=np.float32)
   cdef uint32_t[:] labelct = np.zeros( (labels.size,), dtype=np.uint32)
 
   cdef size_t sx, sy
@@ -392,8 +413,8 @@ def compute_centroids(cnp.ndarray[uint32_t, ndim=2] labels):
 
   result = {}
 
-  cdef float cx = sx / 2
-  cdef float cy = sy / 2
+  cdef float cx = wx * sx / 2
+  cdef float cy = wy * sy / 2
 
   cdef float px, py
 
@@ -401,34 +422,36 @@ def compute_centroids(cnp.ndarray[uint32_t, ndim=2] labels):
     if labelct[label] == 0:
       continue
 
-    px = <float>xsum[label] / <float>labelct[label]
-    py = <float>ysum[label] / <float>labelct[label]
+    px = wx * <float>xsum[label] / <float>labelct[label]
+    py = wy * <float>ysum[label] / <float>labelct[label]
 
     # Since we don't know which coordinate frame we 
     # are using, round toward the center of the image
     # to ensure we get the same pixel every time.
     if px - cx >= 0:
-      px = (<int>px)
+      px = px # will be truncated towards center
     else:
-      px = (<int>px) + 1.0
+      px = px + wx
 
     if py - cy >= 0:
-      py = <int>py
+      py = py # will be truncated towards center
     else:
-      py = (<int>py) + 1.0
+      py = py + wy
 
-    result[label] = (<int>px, <int>py)
+    result[label] = (<int>(px / wx), <int>(py / wy))
 
   return result
 
 def find_border_targets(
     cnp.ndarray[float, ndim=2] dt,
-    cnp.ndarray[uint32_t, ndim=2] cc_labels
+    cnp.ndarray[uint32_t, ndim=2] cc_labels,
+    float wx, float wy
   ):
   """
   find_border_targets(
     ndarray[float, ndim=2] dt, 
-    ndarray[uint32_t, ndim=2] cc_labels
+    ndarray[uint32_t, ndim=2] cc_labels,
+    float wx, float wy
   )
 
   Given a set of connected components that line within 
@@ -459,7 +482,7 @@ def find_border_targets(
   pts = {}
 
   cdef uint32_t label = 0
-  cdef dict centroids = compute_centroids(cc_labels)
+  cdef dict centroids = compute_centroids(cc_labels, wx, wy)
 
   cdef float px, py
   cdef float centx, centy
@@ -478,7 +501,9 @@ def find_border_targets(
         px, py = pts[label]
         centx, centy = centroids[label]
         pts[label] = compute_tiebreaker_maxima(
-          px, py, x, y, sx, sy, centx, centy
+          px, py, x, y, 
+          centx, centy,
+          sx, sy, wx, wy
         )
 
   return pts
@@ -486,15 +511,17 @@ def find_border_targets(
 def compute_tiebreaker_maxima(
     float px, float py, 
     float x, float y, 
+    float centx, float centy,
     float sx, float sy,
-    float centx, float centy
+    float wx, float wy
   ):
   """
   compute_tiebreaker_maxima(
     float px, float py, 
     float x, float y, 
+    float centx, float centy,
     float sx, float sy,
-    float centx, float centy
+    float wx, float wy
   )
 
   This function breaks ties for `compute_border_targets`.
@@ -502,6 +529,7 @@ def compute_tiebreaker_maxima(
   (px,py): A previously found distance transform maxima 
   (x,y): The coordinate of the newly found maxima
   (sx,sy): The length and width of the image plane.
+  (wx,wy): Weighting for anisotropy.
   (centx, centy): The centroid of the current label.
 
   We use following topolological criteria to achieve
@@ -521,61 +549,75 @@ def compute_tiebreaker_maxima(
 
   Returns: some (x, y)
   """
-  cdef float cx = <float>sx / 2.0
-  cdef float cy = <float>sy / 2.0
+  cdef float cx = wx * sx / 2.0
+  cdef float cy = wy * sy / 2.0
 
-  cdef float dist1 = distsq(px,py, centx,centy)
-  cdef float dist2 = distsq( x, y, centx,centy)
+  cdef float dist1 = distsq(px,py, centx,centy, wx,wy)
+  cdef float dist2 = distsq( x, y, centx,centy, wx,wy)
 
   if dist2 < dist1:
     return (x, y)
   elif dist1 == dist2:
-    dist1 = distsq(px,py, cx,cy)
-    dist2 = distsq( x, y, cx,cy)
+    dist1 = distsq(px,py, cx,cy, wx,wy)
+    dist2 = distsq( x, y, cx,cy, wx,wy)
     if dist2 < dist1:
       return (x,y)
     elif dist1 == dist2:
-      dist1 = cornerness(px, py, sx, sy)
-      dist2 = cornerness( x,  y, sx, sy)
+      dist1 = cornerness(px, py, sx, sy, wx,wy)
+      dist2 = cornerness( x,  y, sx, sy, wx,wy)
       if dist2 < dist1:
         return (x, y)
       elif dist1 == dist2:
-        dist1 = edgeness(px, py, sx, sy)
-        dist2 = edgeness( x,  y, sx, sy)
+        dist1 = edgeness(px, py, sx, sy, wx,wy)
+        dist2 = edgeness( x,  y, sx, sy, wx,wy)
         if dist2 < dist1:
           return (x, y)
 
   return (px, py)
 
-cdef float edgeness(float x, float y, float sx, float sy):
+cdef float edgeness(
+    float x, float y, float sx, float sy,
+    float wx, float wy
+  ):
   """
   float edgeness(float x, float y, float sx, float sy)
 
   Nearness of (x,y) to the edge of an image of size (sx,sy).
   """
   return min(
-    x - 0.5,
-    sx - 0.5 - x,
-    y - 0.5,
-    sy - 0.5 - y
+    wx * (x - 0.5),
+    wx * (sx - 0.5 - x),
+    wy * (y - 0.5),
+    wy * (sy - 0.5 - y)
   )
 
-cdef float cornerness(float x, float y, float sx, float sy):
+cdef float cornerness(
+    float x, float y, float sx, float sy,
+    float wx, float wy
+  ):
   """
-  float cornerness(float x, float y, float sx, float sy)
+  float cornerness(
+      float x, float y, float sx, float sy
+      float wx, float wy
+  )
 
   Nearness of (x,y) to a corner of an image of size (sx,sy).
   """
   return min( 
-    distsq(x,y,-0.5,-0.5), 
-    distsq(x,y,sx-0.5,-0.5),
-    distsq(x,y,sx-0.5,sy-0.5),
-    distsq(x,y,-0.5,sx-0.5)
+    distsq(x,y,-0.5,-0.5, wx, wy), 
+    distsq(x,y,sx-0.5,-0.5, wx, wy),
+    distsq(x,y,sx-0.5,sy-0.5, wx, wy),
+    distsq(x,y,-0.5,sx-0.5, wx, wy)
   )
 
-cdef float distsq(float p1x, float p1y, float p2x, float p2y):
-  p1x = (p1x - p2x)
-  p1y = (p1y - p2y)
+cdef float distsq(
+    float p1x, float p1y, 
+    float p2x, float p2y, 
+    float wx, float wy
+  ):
+
+  p1x = wx * (p1x - p2x)
+  p1y = wy * (p1y - p2y)
   return p1x * p1x + p1y * p1y 
 
 @cython.boundscheck(False)
@@ -630,6 +672,52 @@ def roll_invalidation_cube(
 
   return invalidated, labels
 
+@cython.boundscheck(False)
+@cython.wraparound(False)  # turn off negative index wrapping for entire function
+@cython.nonecheck(False)
+def unique(cnp.ndarray[INTEGER, ndim=3] labels, return_counts=False):
+  """
+  unique(cnp.ndarray[INTEGER, ndim=3] labels, return_counts=False)
+
+  Faster implementation of np.unique that depends
+  on the maximum label in the array being less than
+  the size of the array.
+  """
+  cdef size_t max_label = np.max(labels)
+
+  cdef cnp.ndarray[uint32_t, ndim=1] counts = np.zeros( 
+    (max_label+1,), dtype=np.uint32
+  )
+
+  cdef size_t x, y, z
+  cdef size_t sx = labels.shape[0]
+  cdef size_t sy = labels.shape[1]
+  cdef size_t sz = labels.shape[2]
+
+  if labels.flags['C_CONTIGUOUS']:
+    for x in range(sx):
+      for y in range(sy):
+        for z in range(sz):
+          counts[labels[x,y,z]] += 1
+  else:
+    for z in range(sz):
+      for y in range(sy):
+        for x in range(sx):
+          counts[labels[x,y,z]] += 1
+
+  cdef list segids = []
+  cdef list cts = []
+
+  cdef size_t i = 0
+  for i in range(max_label + 1):
+    if counts[i] > 0:
+      segids.append(i)
+      cts.append(counts[i])
+
+  if return_counts:
+    return segids, cts
+  else:
+    return segids
 
 @cython.boundscheck(False)
 @cython.wraparound(False)  # turn off negative index wrapping for entire function
